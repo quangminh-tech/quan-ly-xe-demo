@@ -1,0 +1,45 @@
+# Node.js dependencies
+node_modules/
+**/node_modules/
+
+# Environment variables - bảo mật
+.env
+.env.*
+!.env.example
+
+# Build
+dist/
+build/
+.nuxt/
+.output/
+coverage/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Cache
+.cache/
+.npm/
+.vite/
+*.tsbuildinfo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Local database (JSON mode)
+data/*.json
+!data/example.json
+
+# Uploads
+uploads/
+tmp/
+temp/
