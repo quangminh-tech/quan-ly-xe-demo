@@ -10,21 +10,54 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 const root=path.dirname(fileURLToPath(import.meta.url));
-const file=path.join(root,'data','local.json');const sample=path.join(root,'data','demo.json');
-const app=express(),secret=process.env.JWT_SECRET?.length >= 32 ? process.env.JWT_SECRET : randomBytes(48).toString('hex');
-if(!process.env.JWT_SECRET)console.warn('JWT secret ngẫu nhiên chỉ dùng cho phiên hiện tại; token cũ sẽ hết hiệu lực sau restart.');
+const dataDir=process.env.DATA_DIR?path.resolve(process.env.DATA_DIR):path.join(root,'data');
+fs.mkdirSync(dataDir,{recursive:true});
+const file=path.join(dataDir,'local.json');const sample=path.join(root,'data','demo.json');
+const app=express();
+const isProduction=process.env.NODE_ENV==='production';
+if(isProduction && (!process.env.JWT_SECRET || process.env.JWT_SECRET.length<32)) {
+  console.error('Production requires JWT_SECRET with at least 32 characters.');process.exit(1);
+}
+const secret=process.env.JWT_SECRET?.length>=32?process.env.JWT_SECRET:randomBytes(48).toString('hex');
+if(!process.env.JWT_SECRET)console.warn('Local-only ephemeral JWT secret: sessions expire when the server restarts.');
+const demoBootstrap=!isProduction && process.env.DEMO_BOOTSTRAP!=='false';
+const bootstrapUsername=process.env.ADMIN_USERNAME||'admin';
+const bootstrapPassword=process.env.ADMIN_PASSWORD||(demoBootstrap?'vungoimora':'');
+if(isProduction && process.env.ADMIN_PASSWORD && process.env.ADMIN_PASSWORD.length<12){console.error('ADMIN_PASSWORD must be at least 12 characters');process.exit(1)}
+if(!demoBootstrap && (!process.env.ADMIN_USERNAME||!process.env.ADMIN_PASSWORD)) {
+  // Existing persisted admins are valid, but a fresh production instance needs explicit bootstrap credentials.
+  if(!fs.existsSync(file)) {console.error('Fresh deployment requires ADMIN_USERNAME and ADMIN_PASSWORD environment variables.');process.exit(1)}
+}
 const stamp=()=>new Date().toISOString();
-const initial=()=>{const d=JSON.parse(fs.readFileSync(sample,'utf8'));return {...d,users:[{id:randomUUID(),email:'admin',role:'admin',active:true,password_hash:bcrypt.hashSync('vungoimora',12),created_at:stamp()}],audit_logs:[]}};
+const initial=()=>{
+ const d=JSON.parse(fs.readFileSync(sample,'utf8'));
+ const users=bootstrapPassword?[{id:randomUUID(),email:bootstrapUsername,role:'admin',active:true,password_hash:bcrypt.hashSync(bootstrapPassword,12),created_at:stamp()}]:[];
+ return {...d,users,audit_logs:[]};
+};
 if(!fs.existsSync(file))fs.writeFileSync(file,JSON.stringify(initial(),null,2),{mode:0o600});
 let db=JSON.parse(fs.readFileSync(file,'utf8'));
-if(!db.users?.some(u=>u.email==='admin')){db.users ||= [];db.users.push({id:randomUUID(),email:'admin',role:'admin',active:true,password_hash:bcrypt.hashSync('vungoimora',12),created_at:stamp()});fs.writeFileSync(file,JSON.stringify(db,null,2),{mode:0o600})}for(const key of ['users','audit_logs','drivers','vehicles','routes','bookings','settlements','settlement_periods','ledger_entries'])db[key] ||= [];
+if(demoBootstrap && !db.users?.length && bootstrapPassword){db.users=[{id:randomUUID(),email:bootstrapUsername,role:'admin',active:true,password_hash:bcrypt.hashSync(bootstrapPassword,12),created_at:stamp()}];fs.writeFileSync(file,JSON.stringify(db,null,2),{mode:0o600})}
+for(const key of ['users','audit_logs','drivers','vehicles','routes','bookings','settlements','settlement_periods','ledger_entries'])db[key] ||= [];
 let pending=Promise.resolve();
-function save(){const content=JSON.stringify(db,null,2);pending=pending.then(async()=>{const tmp=file+'.tmp';await fs.promises.writeFile(tmp,content);await fs.promises.rename(tmp,file)});return pending;}
+function save(){const content=JSON.stringify(db,null,2);pending=pending.catch(error=>{console.error('Previous JSON save failed:',error.message)}).then(async()=>{const tmp=file+'.tmp';await fs.promises.writeFile(tmp,content,{mode:0o600});await fs.promises.rename(tmp,file)});return pending;}
 const collection=name=>db[name];const current=(name)=>collection(name).filter(x=>!x.deleted_at);const byid=(name,id)=>current(name).find(x=>x.id===id);
 const bad=(message,status=400)=>{const e=new Error(message);e.status=status;throw e};
 const handle=fn=>async(req,res)=>{try{const val=await fn(req);res.status(val?.__created?201:200).json(val?.__created?val.record:val)}catch(e){console.error(e.message);res.status(e.status||400).json({error:e.message})}};
 function audit(req,action,entity,id,detail={}){db.audit_logs.push({id:randomUUID(),actor_id:req.user.id,actor:req.user.email,action,entity,entity_id:String(id),detail,created_at:stamp()})}
 function create(req,name,record){const v={id:randomUUID(),created_at:stamp(),...record};db[name].push(v);audit(req,'create',name,v.id);return v;}
+function validateBookingLinks(b,excludeId=null){
+ const vehicle=b.vehicle_id?byid('vehicles',b.vehicle_id):null;
+ const driver=b.driver_id?byid('drivers',b.driver_id):null;
+ if(b.vehicle_id&&!vehicle)bad('Phương tiện không tồn tại',409);
+ if(b.driver_id&&!driver)bad('Tài xế không tồn tại',409);
+ if(b.route_id&&!byid('routes',b.route_id))bad('Tuyến không tồn tại',409);
+ if(vehicle?.status&&vehicle.status!=='available')bad('Xe không ở trạng thái sẵn sàng',409);
+ if(driver?.status&&driver.status!=='active')bad('Tài xế không hoạt động',409);
+ if(b.departure_at&&!Number.isFinite(Date.parse(b.departure_at)))bad('Ngày khởi hành không hợp lệ');
+ if(b.fare!==undefined&&(!Number.isFinite(Number(b.fare))||Number(b.fare)<0))bad('Cước chuyến không hợp lệ');
+ const start=Date.parse(b.departure_at);
+ if(Number.isFinite(start)&& (driver||vehicle) &&current('bookings').some(x=>x.id!==excludeId&&['pending','accepted'].includes(x.status)&&Math.abs(Date.parse(x.departure_at)-start)<60*60*1000&&(driver&&x.driver_id===driver.id||vehicle&&x.vehicle_id===vehicle.id)))bad('Xe hoặc tài xế có chuyến khác trong vòng một giờ',409);
+}
 function decorateBookings(x){return {...x,driver_name:byid('drivers',x.driver_id)?.full_name||null,plate:byid('vehicles',x.vehicle_id)?.plate||null}}
 function decorateSettlements(x){const d=byid('drivers',x.driver_id),p=byid('settlement_periods',x.period_id);return {...x,full_name:d?.full_name||'',phone:d?.phone||'',period_name:p?.name||'',period_status:p?.status||'draft',plate:byid('vehicles',x.vehicle_id)?.plate||null}}
 app.disable('x-powered-by');app.use(helmet({contentSecurityPolicy:false}));app.use(express.json({limit:'256kb'}));app.use('/api/login',rateLimit({windowMs:15*60*1000,limit:20,standardHeaders:'draft-7',legacyHeaders:false}));
@@ -47,26 +80,27 @@ app.post('/api/routes',auth,roles('admin','dispatcher'),handle(async req=>{const
 app.put('/api/routes/:id',auth,roles('admin','dispatcher'),handle(async req=>{const v=byid('routes',req.params.id);if(!v)bad('Không tìm thấy',404);if(!req.body.name||!req.body.pickup||!req.body.dropoff)bad('Thiếu thông tin tuyến');Object.assign(v,allowed(req.body,['name','pickup','dropoff','estimated_fare']),{updated_at:stamp()});audit(req,'update','routes',v.id);await save();return v}));
 app.delete('/api/routes/:id',auth,roles('admin'),handle(async req=>{const v=byid('routes',req.params.id);if(!v)bad('Không tìm thấy',404);v.deleted_at=stamp();audit(req,'delete','routes',v.id);await save();return {ok:true}}));
 app.get('/api/bookings',auth,handle(req=>current('bookings').filter(x=>req.user.role!=='driver'||x.driver_id===req.user.driver_id).slice().reverse().map(decorateBookings)));
-app.post('/api/bookings',auth,roles('admin','dispatcher'),handle(async req=>{const b=req.body;if(!b.customer_name||!b.pickup||!b.dropoff||!b.departure_at)bad('Thiếu thông tin chuyến');const v=create(req,'bookings',{...allowed(b,['route_id','driver_id','vehicle_id','customer_name','customer_phone','pickup','dropoff','departure_at','fare','notes']),code:'BK-'+Date.now().toString(36).toUpperCase(),status:'pending',created_by:req.user.id});await save();return {__created:true,record:v}}));
-app.put('/api/bookings/:id',auth,roles('admin','dispatcher'),handle(async req=>{const v=byid('bookings',req.params.id);if(!v)bad('Không tìm thấy',404);if(v.status!=='pending')bad('Chỉ sửa chuyến đang chờ',409);const b=req.body;if(!b.customer_name||!b.pickup||!b.dropoff||!b.departure_at)bad('Thiếu thông tin chuyến');Object.assign(v,allowed(b,['route_id','driver_id','vehicle_id','customer_name','customer_phone','pickup','dropoff','departure_at','fare','notes']),{updated_at:stamp()});audit(req,'update','bookings',v.id);await save();return v}));
+app.post('/api/bookings',auth,roles('admin','dispatcher'),handle(async req=>{const b=req.body;if(!b.customer_name||!b.pickup||!b.dropoff||!b.departure_at)bad('Thiếu thông tin chuyến');validateBookingLinks(b);const v=create(req,'bookings',{...allowed(b,['route_id','driver_id','vehicle_id','customer_name','customer_phone','pickup','dropoff','departure_at','fare','notes']),code:'BK-'+Date.now().toString(36).toUpperCase(),status:'pending',created_by:req.user.id});await save();return {__created:true,record:v}}));
+app.put('/api/bookings/:id',auth,roles('admin','dispatcher'),handle(async req=>{const v=byid('bookings',req.params.id);if(!v)bad('Không tìm thấy',404);if(v.status!=='pending')bad('Chỉ sửa chuyến đang chờ',409);const b=req.body;if(!b.customer_name||!b.pickup||!b.dropoff||!b.departure_at)bad('Thiếu thông tin chuyến');validateBookingLinks(b,v.id);Object.assign(v,allowed(b,['route_id','driver_id','vehicle_id','customer_name','customer_phone','pickup','dropoff','departure_at','fare','notes']),{updated_at:stamp()});audit(req,'update','bookings',v.id);await save();return v}));
 app.delete('/api/bookings/:id',auth,roles('admin'),handle(async req=>{const v=byid('bookings',req.params.id);if(!v||v.status!=='pending')bad('Chỉ xóa chuyến đang chờ',409);v.deleted_at=stamp();audit(req,'delete','bookings',v.id);await save();return {ok:true}}));
-app.patch('/api/bookings/:id/status',auth,handle(async req=>{const v=byid('bookings',req.params.id);if(!v)bad('Không tìm thấy',404);if(req.user.role==='driver'&&v.driver_id!==req.user.driver_id)bad('Không đủ quyền',403);if(!['admin','dispatcher','driver'].includes(req.user.role))bad('Không đủ quyền',403);const valid=req.user.role==='driver'?['accepted','rejected']:['accepted','rejected','completed','cancelled'];if(!valid.includes(req.body.status))bad('Trạng thái không được phép',403);if(!['pending','accepted'].includes(v.status))bad('Chuyến đã được xử lý',409);v.status=req.body.status;v.reviewed_by=req.user.id;v.reviewed_at=stamp();audit(req,'status','booking',v.id,{status:v.status});await save();return v}));
+app.patch('/api/bookings/:id/status',auth,handle(async req=>{const v=byid('bookings',req.params.id);if(!v)bad('Không tìm thấy',404);if(req.user.role==='driver'&&v.driver_id!==req.user.driver_id)bad('Không đủ quyền',403);if(!['admin','dispatcher','driver'].includes(req.user.role))bad('Không đủ quyền',403);const transitions={pending:['accepted','rejected','cancelled'],accepted:['completed','cancelled']};const permitted=req.user.role==='driver'?['accepted','rejected']:['accepted','rejected','completed','cancelled'];if(!permitted.includes(req.body.status))bad('Trạng thái không được phép',403);if(!transitions[v.status]?.includes(req.body.status))bad('Chuyển trạng thái chuyến không hợp lệ',409);v.status=req.body.status;v.reviewed_by=req.user.id;v.reviewed_at=stamp();audit(req,'status','booking',v.id,{status:v.status});await save();return v}));
 app.get('/api/periods',auth,roles('admin','accountant','dispatcher','director'),handle(()=>current('settlement_periods').slice().reverse()));
 app.post('/api/periods',auth,roles('admin','accountant'),handle(async req=>{if(!req.body.name)bad('Thiếu tên kỳ');const v=create(req,'settlement_periods',{...allowed(req.body,['name','from_date','to_date']),status:'draft'});await save();return {__created:true,record:v}}));
 app.put('/api/periods/:id',auth,roles('admin','accountant'),handle(async req=>{const v=byid('settlement_periods',req.params.id);if(!v||v.status!=='draft')bad('Chỉ sửa kỳ chưa chốt',409);if(!req.body.name)bad('Thiếu tên kỳ');Object.assign(v,allowed(req.body,['name','from_date','to_date']),{updated_at:stamp()});audit(req,'update','periods',v.id);await save();return v}));
 app.patch('/api/periods/:id/approve',auth,roles('director'),handle(async req=>{const v=byid('settlement_periods',req.params.id);if(!v||v.status!=='locked')bad('Chỉ duyệt kỳ đã được kế toán chốt',409);v.status='approved';v.approved_by=req.user.id;v.approved_at=stamp();audit(req,'approve','period',v.id);await save();return v}));
 app.patch('/api/periods/:id/lock',auth,roles('admin','accountant'),handle(async req=>{const v=byid('settlement_periods',req.params.id);if(!v||v.status!=='draft')bad('Kỳ không tồn tại hoặc đã chốt');v.status='locked';audit(req,'lock','period',v.id);await save();return v}));
 app.get('/api/settlements',auth,handle(req=>current('settlements').filter(x=>(req.user.role!=='driver'||x.driver_id===req.user.driver_id)&&(!req.query.phone||byid('drivers',x.driver_id)?.phone===req.query.phone)).slice().reverse().map(decorateSettlements)));
-app.post('/api/settlements',auth,roles('admin','accountant'),handle(async req=>{const b=req.body,p=byid('settlement_periods',b.period_id);if(!p||p.status!=='draft')bad('Chỉ sửa kỳ đang mở');if(!byid('drivers',b.driver_id))bad('Tài xế không tồn tại');const fields=['period_id','driver_id','vehicle_id','gross_revenue','promo','card_rides','card_fee','tips','insured_trips','insurance_fee','app_fee','wallet','wallet_return','collection_status','note'];let v=current('settlements').find(x=>x.period_id===b.period_id&&x.driver_id===b.driver_id);if(v){Object.assign(v,allowed(b,fields),{updated_at:stamp()});audit(req,'update','settlement',v.id)}else{v=create(req,'settlements',{...allowed(b,fields),collection_status:b.collection_status||'pending'})}await save();return v}));
+app.post('/api/settlements',auth,roles('admin','accountant'),handle(async req=>{const b=req.body,p=byid('settlement_periods',b.period_id);if(!p||p.status!=='draft')bad('Chỉ sửa kỳ đang mở');if(!byid('drivers',b.driver_id))bad('Tài xế không tồn tại');if(b.vehicle_id&&!byid('vehicles',b.vehicle_id))bad('Xe không tồn tại');for(const k of ['gross_revenue','promo','card_rides','card_fee','tips','insured_trips','insurance_fee','app_fee','wallet','wallet_return']){if(b[k]!==undefined&&(!Number.isFinite(Number(b[k]))||Number(b[k])<0))bad('Số liệu không hợp lệ: '+k)};const fields=['period_id','driver_id','vehicle_id','gross_revenue','promo','card_rides','card_fee','tips','insured_trips','insurance_fee','app_fee','wallet','wallet_return','collection_status','note'];let v=current('settlements').find(x=>x.period_id===b.period_id&&x.driver_id===b.driver_id);if(v){Object.assign(v,allowed(b,fields),{updated_at:stamp()});audit(req,'update','settlement',v.id)}else{v=create(req,'settlements',{...allowed(b,fields),collection_status:b.collection_status||'pending'})}await save();return v}));
 app.delete('/api/settlements/:id',auth,roles('admin','accountant'),handle(async req=>{const v=byid('settlements',req.params.id);if(!v||byid('settlement_periods',v.period_id)?.status!=='draft')bad('Không thể xóa phiếu đã chốt');v.deleted_at=stamp();audit(req,'delete','settlement',v.id);await save();return {ok:true}}));
 app.get('/api/ledger',auth,handle(req=>current('ledger_entries').filter(x=>!x.reversed_at&&(req.user.role!=='driver'||x.driver_id===req.user.driver_id)).slice().reverse().map(x=>({...x,full_name:byid('drivers',x.driver_id)?.full_name||''}))));
-app.post('/api/ledger',auth,roles('admin','accountant'),handle(async req=>{const b=req.body;if(!byid('drivers',b.driver_id)||!['receivable','payment','adjustment','refund'].includes(b.entry_type)||!(Number(b.amount)>0))bad('Chứng từ không hợp lệ');const v=create(req,'ledger_entries',{...allowed(b,['driver_id','settlement_id','entry_type','amount','note']),created_by:req.user.id});await save();return {__created:true,record:v}}));
+app.post('/api/ledger',auth,roles('admin','accountant'),handle(async req=>{const b=req.body;if(!byid('drivers',b.driver_id)||!['receivable','payment','adjustment','refund'].includes(b.entry_type)||!Number.isSafeInteger(Number(b.amount))||Number(b.amount)<=0)bad('Chứng từ không hợp lệ');if(b.settlement_id){const settlement=byid('settlements',b.settlement_id);if(!settlement||settlement.driver_id!==b.driver_id)bad('Phiếu đối soát không thuộc tài xế',409)}const v=create(req,'ledger_entries',{...allowed(b,['driver_id','settlement_id','entry_type','amount','note']),created_by:req.user.id});await save();return {__created:true,record:v}}));
 app.post('/api/ledger/:id/reverse',auth,roles('admin','accountant'),handle(async req=>{const v=byid('ledger_entries',req.params.id);if(!v||v.reversed_at)bad('Chứng từ không tồn tại');v.reversed_at=stamp();audit(req,'reverse','ledger',v.id);await save();return {ok:true}}));
 app.get('/api/users',auth,roles('admin'),handle(()=>current('users').map(({password_hash,...x})=>({...x,driver_name:byid('drivers',x.driver_id)?.full_name||null}))));
 app.post('/api/users',auth,roles('admin'),handle(async req=>{const b=req.body;if(!b.email||!b.password||b.password.length<12||!['admin','accountant','director','dispatcher','driver'].includes(b.role)||b.role==='driver'&&!byid('drivers',b.driver_id))bad('Email, mật khẩu >=12 ký tự, vai trò, tài xế không hợp lệ');if(current('users').some(x=>x.email===b.email))bad('Email đã tồn tại',409);const v=create(req,'users',{email:b.email,role:b.role,driver_id:b.driver_id||null,active:true,password_hash:await bcrypt.hash(b.password,10)});await save();const {password_hash,...clean}=v;return {__created:true,record:clean}}));
 app.patch('/api/users/:id/active',auth,roles('admin'),handle(async req=>{if(req.params.id===req.user.id)bad('Không được khóa tài khoản đang dùng',403);const v=byid('users',req.params.id);if(!v)bad('Không tìm thấy',404);v.active=Boolean(req.body.active);audit(req,'toggle','user',v.id,{active:v.active});await save();return {id:v.id,active:v.active}}));
 app.get('/api/audit',auth,roles('admin'),handle(()=>db.audit_logs.slice(-150).reverse()));
 app.use('/api/reports',reportsRouter({database:()=>db,auth}));
-app.get('/api/mode',(_req,res)=>res.json({mode:'json',file:'server/data/local.json'}));
+app.get('/api/health',(_req,res)=>res.json({status:'ok'}));
 const dist=path.join(root,'../dist');if(fs.existsSync(dist)){app.use(express.static(dist));app.get('*',(_req,res)=>res.sendFile(path.join(dist,'index.html')))}
-app.listen(process.env.PORT||8788,process.env.HOST||'127.0.0.1',()=>console.log(`API JSON: http://${process.env.HOST||'127.0.0.1'}:${process.env.PORT||8788} | Dữ liệu: server/data/local.json`));
+const port=Number(process.env.PORT||8788);const host=process.env.HOST||(isProduction?'0.0.0.0':'127.0.0.1');
+app.listen(port,host,()=>console.log(`Server listening on ${host}:${port} (JSON demo storage)`));
